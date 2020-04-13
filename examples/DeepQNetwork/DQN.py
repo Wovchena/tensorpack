@@ -3,22 +3,23 @@
 # File: DQN.py
 # Author: Yuxin Wu
 
-import argparse
+import datetime
 import numpy as np
-import os
 import cv2
 import gym
+import gym.envs.atari
+import gym.wrappers
 import tensorflow as tf
 
 from tensorpack import *
+from tensorpack.tfutils.scope_utils import auto_reuse_variable_scope
 
 from atari_wrapper import FireResetEnv, FrameStack, LimitLength, MapState
 from common import Evaluator, eval_model_multithread, play_n_episodes
-from DQNModel import Model as DQNModel
 from expreplay import ExpReplay
 
 BATCH_SIZE = 64
-IMAGE_SIZE = (84, 84)
+IMAGE_SIZE = (84, 75)
 FRAME_HISTORY = 4
 UPDATE_FREQ = 4  # the number of new state transitions per parameter update (per training step)
 
@@ -28,40 +29,53 @@ INIT_MEMORY_SIZE = MEMORY_SIZE // 20
 STEPS_PER_EPOCH = 100000 // UPDATE_FREQ  # each epoch is 100k state transitions
 NUM_PARALLEL_PLAYERS = 3
 
-USE_GYM = False
-ENV_NAME = None
 
+class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.shape = (84, 75)
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=self.shape, dtype=np.uint8)
 
-def resize_keepdims(im, size):
-    # Opencv's resize remove the extra dimension for grayscale images. We add it back.
-    ret = cv2.resize(im, size)
-    if im.ndim == 3 and ret.ndim == 2:
-        ret = ret[:, :, np.newaxis]
-    return ret
+    def observation(self, observation):
+        return cv2.resize(cv2.cvtColor(observation[-180:, :160], cv2.COLOR_RGB2GRAY),
+                          (75, 84), interpolation=cv2.INTER_AREA)
 
 
 def get_player(viz=False, train=False):
-    if USE_GYM:
-        env = gym.make(ENV_NAME)
-    else:
-        from atari import AtariPlayer
-        env = AtariPlayer(ENV_NAME, frame_skip=4, viz=viz,
-                          live_lost_as_eoe=train, max_num_frames=60000)
-    env = FireResetEnv(env)
-    env = MapState(env, lambda im: resize_keepdims(im, IMAGE_SIZE))
+    env = CropGrayScaleResizeWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv('breakout', obs_type='image',
+        frameskip=4, repeat_action_probability=0.25), 60000))
     if not train:
         # in training, history is taken care of in expreplay buffer
         env = FrameStack(env, FRAME_HISTORY)
-    if train and USE_GYM:
-        env = LimitLength(env, 60000)
     return env
 
 
-class Model(DQNModel):
-    """
-    A DQN model for 2D/3D (image) observations.
-    """
-    def _get_DQN_prediction(self, image):
+class Model(ModelDesc):
+    state_dtype = tf.uint8
+
+    def __init__(self, state_shape, history, method, num_actions):
+        """
+        Args:
+            state_shape (tuple[int]),
+            history (int):
+        """
+        self.state_shape = tuple(state_shape)
+        self._stacked_state_shape = (-1, ) + self.state_shape + (history, )
+        self.history = history
+        self.method = method
+        self.num_actions = num_actions
+
+    def inputs(self):
+        # When we use h history frames, the current state and the next state will have (h-1) overlapping frames.
+        # Therefore we use a combined state for efficiency:
+        # The first h are the current state, and the last h are the next state.
+        return [tf.TensorSpec((None,) + self.state_shape + (self.history + 1, ), self.state_dtype, 'comb_state'),
+                tf.TensorSpec((None,), tf.int64, 'action'),
+                tf.TensorSpec((None,), tf.float32, 'reward'),
+                tf.TensorSpec((None,), tf.bool, 'isOver')]
+
+    @auto_reuse_variable_scope
+    def get_DQN_prediction(self, image):
         assert image.shape.rank in [4, 5], image.shape
         # image: N, H, W, (C), Hist
         if image.shape.rank == 5:
@@ -77,30 +91,72 @@ class Model(DQNModel):
                  .Conv2D('conv0', 32, 8, strides=4)
                  .Conv2D('conv1', 64, 4, strides=2)
                  .Conv2D('conv2', 64, 3)
-
-                 # architecture used for the figure in the README, slower but takes fewer iterations to converge
-                 # .Conv2D('conv0', out_channel=32, kernel_shape=5)
-                 # .MaxPooling('pool0', 2)
-                 # .Conv2D('conv1', out_channel=32, kernel_shape=5)
-                 # .MaxPooling('pool1', 2)
-                 # .Conv2D('conv2', out_channel=64, kernel_shape=4)
-                 # .MaxPooling('pool2', 2)
-                 # .Conv2D('conv3', out_channel=64, kernel_shape=3)
-
                  .FullyConnected('fc0', 512)
                  .tf.nn.leaky_relu(alpha=0.01)())
-        if self.method != 'Dueling':
-            Q = FullyConnected('fct', l, self.num_actions)
-        else:
-            # Dueling DQN
-            V = FullyConnected('fctV', l, 1)
-            As = FullyConnected('fctA', l, self.num_actions)
-            Q = tf.add(As, V - tf.reduce_mean(As, 1, keep_dims=True))
+        Q = FullyConnected('fct', l, self.num_actions)
         return tf.identity(Q, name='Qvalue')
+
+    def build_graph(self, comb_state, action, reward, isOver):
+        comb_state = tf.cast(comb_state, tf.float32)
+        input_rank = comb_state.shape.rank
+
+        state = tf.slice(
+            comb_state,
+            [0] * input_rank,
+            [-1] * (input_rank - 1) + [self.history], name='state')
+
+        self.predict_value = self.get_DQN_prediction(state)
+        if not self.training:
+            return
+
+        reward = tf.clip_by_value(reward, -1, 1)
+        next_state = tf.slice(
+            comb_state,
+            [0] * (input_rank - 1) + [1],
+            [-1] * (input_rank - 1) + [self.history], name='next_state')
+        next_state = tf.reshape(next_state, self._stacked_state_shape)
+        action_onehot = tf.one_hot(action, self.num_actions, 1.0, 0.0)
+
+        pred_action_value = tf.reduce_sum(self.predict_value * action_onehot, 1)  # N,
+        max_pred_reward = tf.reduce_mean(tf.reduce_max(
+            self.predict_value, 1), name='predict_reward')
+        summary.add_moving_summary(max_pred_reward)
+
+        with tf.variable_scope('target'), varreplace.freeze_variables(skip_collection=True):
+            targetQ_predict_value = self.get_DQN_prediction(next_state)    # NxA
+
+        best_v = tf.reduce_max(targetQ_predict_value, 1)    # N,
+        target = reward + (1.0 - tf.cast(isOver, tf.float32)) * 0.99 * tf.stop_gradient(best_v)
+
+        cost = tf.losses.huber_loss(
+            target, pred_action_value, reduction=tf.losses.Reduction.MEAN)
+        summary.add_param_summary(('conv.*/W', ['histogram', 'rms']),
+                                  ('fc.*/W', ['histogram', 'rms']))   # monitor all W
+        summary.add_moving_summary(cost)
+        return cost
+
+    def optimizer(self):
+        lr = tf.get_variable('learning_rate', initializer=1e-3, trainable=False)
+        tf.summary.scalar("learning_rate-summary", lr)
+        opt = tf.train.RMSPropOptimizer(lr, decay=0.95, momentum=0.95, epsilon=1e-2)
+        return optimizer.apply_grad_processors(opt, [gradproc.SummaryGradient()])
+
+    @staticmethod
+    def update_target_param():
+        vars = tf.global_variables()
+        ops = []
+        G = tf.get_default_graph()
+        for v in vars:
+            target_name = v.op.name
+            if target_name.startswith('target'):
+                new_name = target_name.replace('target/', '')
+                logger.info("Target Network Update: {} <- {}".format(target_name, new_name))
+                ops.append(v.assign(G.get_tensor_by_name(new_name + ':0')))
+        return tf.group(*ops, name='update_target_network')
+
 
 
 def get_config(model):
-    global args
     expreplay = ExpReplay(
         predictor_io_names=(['state'], ['Qvalue']),
         get_player=lambda: get_player(train=True),
@@ -124,7 +180,7 @@ def get_config(model):
         callbacks=[
             ModelSaver(),
             PeriodicTrigger(
-                RunOp(DQNModel.update_target_param, verbose=True),
+                RunOp(Model.update_target_param, verbose=True),
                 every_k_steps=5000),    # update target network every 5k steps
             expreplay,
             ScheduledHyperParamSetter('learning_rate',
@@ -133,9 +189,7 @@ def get_config(model):
                 ObjAttrParam(expreplay, 'exploration'),
                 [(0, 1), (10, 0.1), (400, 0.01)],   # 1->0.1 in the first million steps
                 interp='linear'),
-            PeriodicTrigger(Evaluator(
-                args.num_eval, ['state'], ['Qvalue'], get_player),
-                every_k_epochs=5 if 'pong' in args.env.lower() else 10),  # eval more frequently for easy games
+            PeriodicTrigger(Evaluator(50, ['state'], ['Qvalue'], get_player), every_k_epochs=10)
         ],
         steps_per_epoch=STEPS_PER_EPOCH,
         max_epoch=500,  # a total of 50M state transition
@@ -143,45 +197,7 @@ def get_config(model):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
-    parser.add_argument('--load', help='load model')
-    parser.add_argument('--task', help='task to perform',
-                        choices=['play', 'eval', 'train'], default='train')
-    parser.add_argument('--env', required=True,
-                        help='either an atari rom file (that ends with .bin) or a gym atari environment name')
-    parser.add_argument('--algo', help='algorithm',
-                        choices=['DQN', 'Double', 'Dueling'], default='Double')
-    parser.add_argument('--num-eval', default=50, type=int)
-    args = parser.parse_args()
-    if args.gpu:
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-
-    ENV_NAME = args.env
-    USE_GYM = not ENV_NAME.endswith('.bin')
-
-    # set num_actions
-    num_actions = get_player().action_space.n
-    logger.info("ENV: {}, Num Actions: {}".format(args.env, num_actions))
-
-    state_shape = IMAGE_SIZE + (3, ) if USE_GYM else IMAGE_SIZE
-    model = Model(state_shape, FRAME_HISTORY, args.algo, num_actions)
-
-    if args.task != 'train':
-        assert args.load is not None
-        pred = OfflinePredictor(PredictConfig(
-            model=model,
-            session_init=SmartInit(args.load),
-            input_names=['state'],
-            output_names=['Qvalue']))
-        if args.task == 'play':
-            play_n_episodes(get_player(viz=0.01), pred, 100, render=True)
-        elif args.task == 'eval':
-            eval_model_multithread(pred, args.num_eval, get_player)
-    else:
-        logger.set_logger_dir(
-            os.path.join('train_log', 'DQN-{}'.format(
-                os.path.basename(args.env).split('.')[0])))
-        config = get_config(model)
-        config.session_init = SmartInit(args.load)
-        launch_train_with_config(config, SimpleTrainer())
+    logger.set_logger_dir(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
+    config = get_config(Model(IMAGE_SIZE, FRAME_HISTORY, 'DQN', get_player().action_space.n))
+    config.session_init = SmartInit(None)
+    launch_train_with_config(config, SimpleTrainer())
