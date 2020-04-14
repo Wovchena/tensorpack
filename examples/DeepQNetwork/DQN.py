@@ -4,18 +4,18 @@
 # Author: Yuxin Wu
 
 import datetime
+import multiprocessing
 import numpy as np
 import cv2
 import gym
 import gym.envs.atari
 import gym.wrappers
 import tensorflow as tf
+from collections import deque
 
 from tensorpack import *
 from tensorpack.tfutils.scope_utils import auto_reuse_variable_scope
 
-from atari_wrapper import FireResetEnv, FrameStack, LimitLength, MapState
-from common import Evaluator, eval_model_multithread, play_n_episodes
 from expreplay import ExpReplay
 
 BATCH_SIZE = 64
@@ -39,6 +39,34 @@ class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
     def observation(self, observation):
         return cv2.resize(cv2.cvtColor(observation[-180:, :160], cv2.COLOR_RGB2GRAY),
                           (75, 84), interpolation=cv2.INTER_AREA)
+
+
+class FrameStack(gym.Wrapper):
+    """
+    Buffer consecutive k observations and stack them on a new last axis.
+    The output observation has shape `original_shape + (k, )`.
+    """
+    def __init__(self, env, k):
+        gym.Wrapper.__init__(self, env)
+        self.k = k
+        self.frames = deque([], maxlen=k)
+
+    def reset(self):
+        """Clear buffer and re-fill by duplicating the first observation."""
+        ob = self.env.reset()
+        for _ in range(self.k - 1):
+            self.frames.append(np.zeros_like(ob))
+        self.frames.append(ob)
+        return self.observation()
+
+    def step(self, action):
+        ob, reward, done, info = self.env.step(action)
+        self.frames.append(ob)
+        return self.observation(), reward, done, info
+
+    def observation(self):
+        assert len(self.frames) == self.k
+        return np.stack(self.frames, axis=-1)
 
 
 def get_player(viz=False, train=False):
@@ -141,19 +169,41 @@ class Model(ModelDesc):
         opt = tf.train.RMSPropOptimizer(lr, decay=0.95, momentum=0.95, epsilon=1e-2)
         return optimizer.apply_grad_processors(opt, [gradproc.SummaryGradient()])
 
-    @staticmethod
-    def update_target_param():
-        vars = tf.global_variables()
-        ops = []
-        G = tf.get_default_graph()
-        for v in vars:
-            target_name = v.op.name
-            if target_name.startswith('target'):
-                new_name = target_name.replace('target/', '')
-                logger.info("Target Network Update: {} <- {}".format(target_name, new_name))
-                ops.append(v.assign(G.get_tensor_by_name(new_name + ':0')))
-        return tf.group(*ops, name='update_target_network')
 
+def update_target_param():
+    vars = tf.global_variables()
+    ops = []
+    G = tf.get_default_graph()
+    for v in vars:
+        target_name = v.op.name
+        if target_name.startswith('target'):
+            new_name = target_name.replace('target/', '')
+            logger.info("Target Network Update: {} <- {}".format(target_name, new_name))
+            ops.append(v.assign(G.get_tensor_by_name(new_name + ':0')))
+    return tf.group(*ops, name='update_target_network')
+
+
+class Evaluator(Callback):
+    def __init__(self, nr_eval, input_names, output_names, get_player_fn):
+        self.eval_episode = nr_eval
+        self.input_names = input_names
+        self.output_names = output_names
+        self.get_player_fn = get_player_fn
+
+    def _setup_graph(self):
+        NR_PROC = min(multiprocessing.cpu_count() // 2, 20)
+        self.pred_funcs = [self.trainer.get_predictor(
+            self.input_names, self.output_names)] * NR_PROC
+
+    def _trigger(self):
+        t = time.time()
+        mean, max = eval_with_funcs(
+            self.pred_funcs, self.eval_episode, self.get_player_fn)
+        t = time.time() - t
+        if t > 10 * 60:  # eval takes too long
+            self.eval_episode = int(self.eval_episode * 0.94)
+        self.trainer.monitors.put_scalar('mean_score', mean)
+        self.trainer.monitors.put_scalar('max_score', max)
 
 
 def get_config(model):
@@ -180,7 +230,7 @@ def get_config(model):
         callbacks=[
             ModelSaver(),
             PeriodicTrigger(
-                RunOp(Model.update_target_param, verbose=True),
+                RunOp(update_target_param, verbose=True),
                 every_k_steps=5000),    # update target network every 5k steps
             expreplay,
             ScheduledHyperParamSetter('learning_rate',
