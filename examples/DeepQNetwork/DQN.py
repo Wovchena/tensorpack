@@ -183,7 +183,10 @@ def update_target_param():
     return tf.group(*ops, name='update_target_network')
 
 
-def get_config(model):
+if __name__ == '__main__':
+    logger.set_logger_dir(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
+    trainer = SimpleTrainer()
+    model = Model(IMAGE_SIZE, FRAME_HISTORY, 'DQN', get_player().action_space.n)
     expreplay = ExpReplay(
         predictor_io_names=(['state'], ['Qvalue']),
         get_player=lambda: get_player(train=True),
@@ -197,13 +200,10 @@ def get_config(model):
         state_dtype=model.state_dtype.as_numpy_dtype
     )
 
-    # Set to other values if you need a different initial exploration
-    # (e.g., # if you're resuming a training half-way)
-    # expreplay.exploration = 1.0
-
-    return TrainConfig(
-        data=QueueInput(expreplay),
-        model=model,
+    trainer.setup_graph(
+        model.get_input_signature(), QueueInput(expreplay),
+        model.build_graph, model.get_optimizer)
+    trainer.train_with_defaults(
         callbacks=[
             ModelSaver(),
             PeriodicTrigger(
@@ -217,13 +217,6 @@ def get_config(model):
                 ((0, 1), (10, 0.1)),   # 1->0.1 in the first million steps
                 interp='linear')
         ],
+        session_init=SmartInit(None),
         steps_per_epoch=STEPS_PER_EPOCH,
-        max_epoch=500,  # a total of 50M state transition
-    )
-
-
-if __name__ == '__main__':
-    logger.set_logger_dir(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
-    config = get_config(Model(IMAGE_SIZE, FRAME_HISTORY, 'DQN', get_player().action_space.n))
-    config.session_init = SmartInit(None)
-    launch_train_with_config(config, SimpleTrainer())
+        starting_epoch=1)
