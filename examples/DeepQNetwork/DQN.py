@@ -183,29 +183,6 @@ def update_target_param():
     return tf.group(*ops, name='update_target_network')
 
 
-class Evaluator(Callback):
-    def __init__(self, nr_eval, input_names, output_names, get_player_fn):
-        self.eval_episode = nr_eval
-        self.input_names = input_names
-        self.output_names = output_names
-        self.get_player_fn = get_player_fn
-
-    def _setup_graph(self):
-        NR_PROC = min(multiprocessing.cpu_count() // 2, 20)
-        self.pred_funcs = [self.trainer.get_predictor(
-            self.input_names, self.output_names)] * NR_PROC
-
-    def _trigger(self):
-        t = time.time()
-        mean, max = eval_with_funcs(
-            self.pred_funcs, self.eval_episode, self.get_player_fn)
-        t = time.time() - t
-        if t > 10 * 60:  # eval takes too long
-            self.eval_episode = int(self.eval_episode * 0.94)
-        self.trainer.monitors.put_scalar('mean_score', mean)
-        self.trainer.monitors.put_scalar('max_score', max)
-
-
 def get_config(model):
     expreplay = ExpReplay(
         predictor_io_names=(['state'], ['Qvalue']),
@@ -234,12 +211,11 @@ def get_config(model):
                 every_k_steps=5000),    # update target network every 5k steps
             expreplay,
             ScheduledHyperParamSetter('learning_rate',
-                                      [(0, 1e-3), (60, 5e-4), (400, 1e-4)]),
+                                      ((0, 1e-3),)),
             ScheduledHyperParamSetter(
                 ObjAttrParam(expreplay, 'exploration'),
-                [(0, 1), (10, 0.1), (400, 0.01)],   # 1->0.1 in the first million steps
-                interp='linear'),
-            PeriodicTrigger(Evaluator(50, ['state'], ['Qvalue'], get_player), every_k_epochs=10)
+                ((0, 1), (10, 0.1)),   # 1->0.1 in the first million steps
+                interp='linear')
         ],
         steps_per_epoch=STEPS_PER_EPOCH,
         max_epoch=500,  # a total of 50M state transition
