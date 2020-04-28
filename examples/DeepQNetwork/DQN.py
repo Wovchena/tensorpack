@@ -4,84 +4,39 @@
 # Author: Yuxin Wu
 
 import datetime
-import multiprocessing
 import numpy as np
 import cv2
 import gym
 import gym.envs.atari
 import gym.wrappers
 import tensorflow as tf
-from collections import deque
 
+import tensorpack
 from tensorpack import *
-from tensorpack.tfutils.scope_utils import auto_reuse_variable_scope
 
 from expreplay import ExpReplay
-
-BATCH_SIZE = 64
-IMAGE_SIZE = (84, 75)
-FRAME_HISTORY = 4
-UPDATE_FREQ = 4  # the number of new state transitions per parameter update (per training step)
-
-MEMORY_SIZE = 1e6
-# will consume at least 1e6 * 84 * 84 bytes == 6.6G memory.
-INIT_MEMORY_SIZE = MEMORY_SIZE // 20
-STEPS_PER_EPOCH = 100000 // UPDATE_FREQ  # each epoch is 100k state transitions
-NUM_PARALLEL_PLAYERS = 3
 
 
 class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         self.shape = (84, 75)
-        self.observation_space = gym.spaces.Box(low=0, high=255, shape=self.shape, dtype=np.uint8)
+        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=self.shape, dtype=np.float32)
 
     def observation(self, observation):
         return cv2.resize(cv2.cvtColor(observation[-180:, :160], cv2.COLOR_RGB2GRAY),
-                          (75, 84), interpolation=cv2.INTER_AREA)
+                          (75, 84), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
 
 
-class FrameStack(gym.Wrapper):
-    """
-    Buffer consecutive k observations and stack them on a new last axis.
-    The output observation has shape `original_shape + (k, )`.
-    """
-    def __init__(self, env, k):
-        gym.Wrapper.__init__(self, env)
-        self.k = k
-        self.frames = deque([], maxlen=k)
-
-    def reset(self):
-        """Clear buffer and re-fill by duplicating the first observation."""
-        ob = self.env.reset()
-        for _ in range(self.k - 1):
-            self.frames.append(np.zeros_like(ob))
-        self.frames.append(ob)
-        return self.observation()
-
-    def step(self, action):
-        ob, reward, done, info = self.env.step(action)
-        self.frames.append(ob)
-        return self.observation(), reward, done, info
-
-    def observation(self):
-        assert len(self.frames) == self.k
-        return np.stack(self.frames, axis=-1)
-
-
-def get_player(viz=False, train=False):
-    env = CropGrayScaleResizeWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv('breakout', obs_type='image',
+def get_player():
+    return CropGrayScaleResizeWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv('breakout', obs_type='image',
         frameskip=4, repeat_action_probability=0.25), 60000))
-    if not train:
-        # in training, history is taken care of in expreplay buffer
-        env = FrameStack(env, FRAME_HISTORY)
-    return env
 
 
 class Model(ModelDesc):
-    state_dtype = tf.uint8
+    state_dtype = tf.float32
 
-    def __init__(self, state_shape, history, method, num_actions):
+    def __init__(self, state_shape, history, num_actions):
         """
         Args:
             state_shape (tuple[int]),
@@ -90,7 +45,6 @@ class Model(ModelDesc):
         self.state_shape = tuple(state_shape)
         self._stacked_state_shape = (-1, ) + self.state_shape + (history, )
         self.history = history
-        self.method = method
         self.num_actions = num_actions
 
     def inputs(self):
@@ -102,17 +56,8 @@ class Model(ModelDesc):
                 tf.TensorSpec((None,), tf.float32, 'reward'),
                 tf.TensorSpec((None,), tf.bool, 'isOver')]
 
-    @auto_reuse_variable_scope
+    @tensorpack.tfutils.scope_utils.auto_reuse_variable_scope
     def get_DQN_prediction(self, image):
-        assert image.shape.rank in [4, 5], image.shape
-        # image: N, H, W, (C), Hist
-        if image.shape.rank == 5:
-            # merge C & Hist
-            image = tf.reshape(
-                image,
-                [-1] + list(self.state_shape[:2]) + [self.state_shape[2] * FRAME_HISTORY])
-
-        image = image / 255.0
         with argscope(Conv2D, activation=lambda x: PReLU('prelu', x), use_bias=True):
             l = (LinearWrap(image)
                  # Nature architecture
@@ -137,7 +82,6 @@ class Model(ModelDesc):
         if not self.training:
             return
 
-        reward = tf.clip_by_value(reward, -1, 1)
         next_state = tf.slice(
             comb_state,
             [0] * (input_rank - 1) + [1],
@@ -158,16 +102,11 @@ class Model(ModelDesc):
 
         cost = tf.losses.huber_loss(
             target, pred_action_value, reduction=tf.losses.Reduction.MEAN)
-        summary.add_param_summary(('conv.*/W', ['histogram', 'rms']),
-                                  ('fc.*/W', ['histogram', 'rms']))   # monitor all W
         summary.add_moving_summary(cost)
         return cost
 
     def optimizer(self):
-        lr = tf.get_variable('learning_rate', initializer=1e-3, trainable=False)
-        tf.summary.scalar("learning_rate-summary", lr)
-        opt = tf.train.RMSPropOptimizer(lr, decay=0.95, momentum=0.95, epsilon=1e-2)
-        return optimizer.apply_grad_processors(opt, [gradproc.SummaryGradient()])
+        return tf.train.RMSPropOptimizer(1e-3, decay=0.95, momentum=0.95, epsilon=1e-2)
 
 
 def update_target_param():
@@ -178,18 +117,26 @@ def update_target_param():
         target_name = v.op.name
         if target_name.startswith('target'):
             new_name = target_name.replace('target/', '')
-            logger.info("Target Network Update: {} <- {}".format(target_name, new_name))
             ops.append(v.assign(G.get_tensor_by_name(new_name + ':0')))
     return tf.group(*ops, name='update_target_network')
 
 
-if __name__ == '__main__':
+def main():
+    BATCH_SIZE = 64
+    IMAGE_SIZE = (84, 75)
+    FRAME_HISTORY = 4
+    UPDATE_FREQ = 4  # the number of new state transitions per parameter update (per training step)
+    MEMORY_SIZE = 1e6
+    INIT_MEMORY_SIZE = MEMORY_SIZE // 20
+    STEPS_PER_EPOCH = 5000
+    NUM_PARALLEL_PLAYERS = 3
+
     logger.set_logger_dir(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     trainer = SimpleTrainer()
-    model = Model(IMAGE_SIZE, FRAME_HISTORY, 'DQN', get_player().action_space.n)
+    model = Model(IMAGE_SIZE, FRAME_HISTORY, get_player().action_space.n)
     expreplay = ExpReplay(
         predictor_io_names=(['state'], ['Qvalue']),
-        get_player=lambda: get_player(train=True),
+        get_player=get_player,
         num_parallel_players=NUM_PARALLEL_PLAYERS,
         state_shape=model.state_shape,
         batch_size=BATCH_SIZE,
@@ -203,20 +150,20 @@ if __name__ == '__main__':
     trainer.setup_graph(
         model.get_input_signature(), QueueInput(expreplay),
         model.build_graph, model.get_optimizer)
-    trainer.train_with_defaults(
-        callbacks=[
-            ModelSaver(),
+    trainer.setup_callbacks(callbacks=[
             PeriodicTrigger(
-                RunOp(update_target_param, verbose=True),
+                RunOp(update_target_param),
                 every_k_steps=5000),    # update target network every 5k steps
             expreplay,
-            ScheduledHyperParamSetter('learning_rate',
-                                      ((0, 1e-3),)),
             ScheduledHyperParamSetter(
                 ObjAttrParam(expreplay, 'exploration'),
-                ((0, 1), (10, 0.1)),   # 1->0.1 in the first million steps
-                interp='linear')
-        ],
-        session_init=SmartInit(None),
-        steps_per_epoch=STEPS_PER_EPOCH,
-        starting_epoch=1)
+                ((0, 1), (50, 0.1)),
+                interp='linear'),
+            MergeAllSummaries()],
+        monitors=[TFEventWriter()])
+    trainer.initialize(session_creator=tfutils.sesscreate.NewSessionCreator(), session_init=SessionInit())
+    trainer.main_loop(STEPS_PER_EPOCH, 1, 9**9)
+
+
+if __name__ == '__main__':
+    main()
