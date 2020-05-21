@@ -4,6 +4,7 @@
 # Author: Yuxin Wu
 
 import datetime
+import itertools
 import numpy as np
 import cv2
 import gym
@@ -58,14 +59,16 @@ class Model(ModelDesc):
 
     @tensorpack.tfutils.scope_utils.auto_reuse_variable_scope
     def get_DQN_prediction(self, image):
-        with argscope(Conv2D, activation=lambda x: PReLU('prelu', x), use_bias=True):
+        with argscope(Conv2D, use_bias=True):
             l = (LinearWrap(image)
-                 # Nature architecture
                  .Conv2D('conv0', 32, 8, strides=4)
+                 .tf.nn.leaky_relu(0.01)
                  .Conv2D('conv1', 64, 4, strides=2)
+                 .tf.nn.leaky_relu(0.01)
                  .Conv2D('conv2', 64, 3)
+                 .tf.nn.leaky_relu(0.01)
                  .FullyConnected('fc0', 512)
-                 .tf.nn.leaky_relu(alpha=0.01)())
+                 .tf.nn.leaky_relu(0.01)())
         Q = FullyConnected('fct', l, self.num_actions)
         return tf.identity(Q, name='Qvalue')
 
@@ -82,6 +85,7 @@ class Model(ModelDesc):
         if not self.training:
             return
 
+        reward = tf.clip_by_value(reward, -1, 1)
         next_state = tf.slice(
             comb_state,
             [0] * (input_rank - 1) + [1],
@@ -126,7 +130,7 @@ def main():
     IMAGE_SIZE = (84, 75)
     FRAME_HISTORY = 4
     UPDATE_FREQ = 4  # the number of new state transitions per parameter update (per training step)
-    MEMORY_SIZE = 1e6
+    MEMORY_SIZE = 10**6
     INIT_MEMORY_SIZE = MEMORY_SIZE // 20
     STEPS_PER_EPOCH = 5000
     NUM_PARALLEL_PLAYERS = 3
@@ -161,8 +165,22 @@ def main():
                 interp='linear'),
             MergeAllSummaries()],
         monitors=[TFEventWriter()])
-    trainer.initialize(session_creator=tfutils.sesscreate.NewSessionCreator(), session_init=SessionInit())
-    trainer.main_loop(STEPS_PER_EPOCH, 1, 9**9)
+
+    trainer.sess = tfutils.sesscreate.NewSessionCreator().create_session()
+    trainer.initialize_hooks()
+    trainer.sess.graph.finalize()
+    for pred in trainer._predictors:
+        pred.sess = trainer.sess
+
+    with trainer.sess.as_default():
+        trainer.loop.config(STEPS_PER_EPOCH, 1, 9**9)
+        trainer.loop.update_global_step()
+        trainer._callbacks.before_train()  # Used by ExpReplay, TFEventWriter
+        for trainer.loop._epoch_num in itertools.count(1):  # TODO itertools.count() when trainer loop is removed
+            for trainer.loop._local_step in range(trainer.loop.steps_per_epoch):
+                trainer.hooked_sess.run(trainer.train_op)
+                trainer._callbacks.trigger_step()  # Used by PeriodicTrigger
+            trainer._callbacks.trigger_epoch()  # Used by ExpReplay, ScheduledHyperParamSetter, TFEventWriter
 
 
 if __name__ == '__main__':
