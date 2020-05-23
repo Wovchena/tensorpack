@@ -133,7 +133,7 @@ def main():
     MEMORY_SIZE = 10**6
     INIT_MEMORY_SIZE = MEMORY_SIZE // 20
     STEPS_PER_EPOCH = 5000
-    NUM_PARALLEL_PLAYERS = 3
+    NUM_PARALLEL_PLAYERS = 1
 
     logger.set_logger_dir(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     trainer = SimpleTrainer()
