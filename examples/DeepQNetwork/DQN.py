@@ -136,7 +136,6 @@ def main():
     NUM_PARALLEL_PLAYERS = 1
 
     logger.set_logger_dir(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
-    trainer = SimpleTrainer()
     model = Model(IMAGE_SIZE, FRAME_HISTORY, get_player().action_space.n)
     expreplay = ExpReplay(
         predictor_io_names=(['state'], ['Qvalue']),
@@ -151,10 +150,18 @@ def main():
         state_dtype=model.state_dtype.as_numpy_dtype
     )
 
-    trainer.setup_graph(
-        model.get_input_signature(), QueueInput(expreplay),
-        model.build_graph, model.get_optimizer)
+    queue_input = QueueInput(expreplay)
+    queue_input._setup(model.get_input_signature())
+    queue_input._setup_done = True
+
+    trainer = SimpleTrainer()
+    trainer.tower_func = tfutils.tower.TowerFunc(model.build_graph, model.get_input_signature())
+    with tfutils.TowerContext('', True):
+        grads = trainer._make_get_grad_fn(queue_input, trainer.tower_func, model.get_optimizer)()
+        trainer.train_op = model.get_optimizer().apply_gradients(grads, name='train_op')
+
     trainer.setup_callbacks(callbacks=[
+            queue_input.get_callbacks(),
             PeriodicTrigger(
                 RunOp(update_target_param),
                 every_k_steps=5000),    # update target network every 5k steps
