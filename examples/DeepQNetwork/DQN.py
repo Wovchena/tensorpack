@@ -134,6 +134,9 @@ def main():
     INIT_MEMORY_SIZE = MEMORY_SIZE // 20
     STEPS_PER_EPOCH = 5000
     NUM_PARALLEL_PLAYERS = 1
+    MIN_EPSILON = 0.1
+    START_EPSILON = 1.0
+    STOP_EPSILON_DECAY_AT = 50
 
     logger.set_logger_dir(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     model = Model(IMAGE_SIZE, FRAME_HISTORY, get_player().action_space.n)
@@ -160,16 +163,12 @@ def main():
         grads = trainer._make_get_grad_fn(queue_input, trainer.tower_func, model.get_optimizer)()
         trainer.train_op = model.get_optimizer().apply_gradients(grads, name='train_op')
 
+    update_target_param_op = update_target_param()
+    expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
+    expreplay._before_train()
+
     trainer.setup_callbacks(callbacks=[
             queue_input.get_callbacks(),
-            PeriodicTrigger(
-                RunOp(update_target_param),
-                every_k_steps=5000),    # update target network every 5k steps
-            expreplay,
-            ScheduledHyperParamSetter(
-                ObjAttrParam(expreplay, 'exploration'),
-                ((0, 1), (50, 0.1)),
-                interp='linear'),
             MergeAllSummaries()],
         monitors=[TFEventWriter()])
 
@@ -182,12 +181,17 @@ def main():
     with trainer.sess.as_default():
         trainer.loop.config(STEPS_PER_EPOCH, 1, 9**9)
         trainer.loop.update_global_step()
-        trainer._callbacks.before_train()  # Used by ExpReplay, TFEventWriter
+        trainer._callbacks.before_train()  # Used by TFEventWriter
         for trainer.loop._epoch_num in itertools.count(1):  # TODO itertools.count() when trainer loop is removed
             for trainer.loop._local_step in range(trainer.loop.steps_per_epoch):
                 trainer.hooked_sess.run(trainer.train_op)
-                trainer._callbacks.trigger_step()  # Used by PeriodicTrigger
-            trainer._callbacks.trigger_epoch()  # Used by ExpReplay, ScheduledHyperParamSetter, TFEventWriter
+            update_target_param_op.run()
+            if expreplay.exploration > MIN_EPSILON:
+                expreplay.exploration -= (START_EPSILON - MIN_EPSILON) / STOP_EPSILON_DECAY_AT
+            mean, max = expreplay.runner.reset_stats()
+            trainer.monitors.put_scalar('expreplay/mean_score', mean)
+            trainer.monitors.put_scalar('expreplay/max_score', max)
+            trainer._callbacks.trigger_epoch()  # Used by TFEventWriter
 
 
 if __name__ == '__main__':
