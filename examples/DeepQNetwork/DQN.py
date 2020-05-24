@@ -4,7 +4,6 @@
 # Author: Yuxin Wu
 
 import datetime
-import itertools
 import numpy as np
 import cv2
 import gym
@@ -47,6 +46,7 @@ class Model(ModelDesc):
         self._stacked_state_shape = (-1, ) + self.state_shape + (history, )
         self.history = history
         self.num_actions = num_actions
+        self.opt = tf.train.RMSPropOptimizer(1e-3, decay=0.95, momentum=0.95, epsilon=1e-2)
 
     def inputs(self):
         # When we use h history frames, the current state and the next state will have (h-1) overlapping frames.
@@ -110,7 +110,7 @@ class Model(ModelDesc):
         return cost
 
     def optimizer(self):
-        return tf.train.RMSPropOptimizer(1e-3, decay=0.95, momentum=0.95, epsilon=1e-2)
+        return self.opt
 
 
 def update_target_param():
@@ -126,13 +126,9 @@ def update_target_param():
 
 
 class ExpReplayWithPlaceholders(ExpReplay):
-    def __init__(self, modelinputs, predictor_io_names, get_player, num_parallel_players, state_shape, batch_size,
-            memory_size, init_memory_size, update_frequency, history_len, state_dtype):
-        super().__init__(predictor_io_names=predictor_io_names, get_player=get_player,
-            num_parallel_players=num_parallel_players, state_shape=state_shape, batch_size=batch_size,
-            memory_size=memory_size, init_memory_size=init_memory_size, update_frequency=update_frequency,
-            history_len=history_len, state_dtype=state_dtype)
-        self.placeholders = [build_or_reuse_placeholder(v) for v in modelinputs]  # TODO take placeholders as argument
+    def __init__(self, placeholders, **kwargs):
+        super().__init__(**kwargs)
+        self.placeholders = placeholders
 
     def get_input_tensors(self): return self.placeholders
 
@@ -147,16 +143,16 @@ def main():
     UPDATE_FREQ = 4  # the number of new state transitions per parameter update (per training step)
     MEMORY_SIZE = 10**6
     INIT_MEMORY_SIZE = MEMORY_SIZE // 20
-    STEPS_PER_EPOCH = 5000
     NUM_PARALLEL_PLAYERS = 1
     MIN_EPSILON = 0.1
     START_EPSILON = 1.0
-    STOP_EPSILON_DECAY_AT = 50
+    STOP_EPSILON_DECAY_AT = 250000
 
-    logger.set_logger_dir(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     model = Model(IMAGE_SIZE, FRAME_HISTORY, get_player().action_space.n)
+    placeholders = tuple(tf.placeholder(tensor_spec.dtype, shape=tensor_spec.shape, name=tensor_spec.name)
+                         for tensor_spec in model.inputs())
     expreplay = ExpReplayWithPlaceholders(
-        model.inputs(),
+        placeholders,
         predictor_io_names=(['state'], ['Qvalue']),
         get_player=get_player,
         num_parallel_players=NUM_PARALLEL_PLAYERS,
@@ -169,49 +165,29 @@ def main():
         state_dtype=model.state_dtype.as_numpy_dtype
     )
 
-    expreplayiter = iter(expreplay)
-
     trainer = SimpleTrainer()
     trainer.tower_func = tfutils.tower.TowerFunc(model.build_graph, model.inputs())
     with tfutils.TowerContext('', True):
-        grads = trainer._make_get_grad_fn(expreplay, trainer.tower_func, model.get_optimizer)()
-        trainer.train_op = model.get_optimizer().apply_gradients(grads, name='train_op')
+        grads = trainer._make_get_grad_fn(expreplay, trainer.tower_func, model.optimizer)()
+        train_op = model.opt.apply_gradients(grads)  # name='train_op'
 
     update_target_param_op = update_target_param()
     expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
     expreplay._before_train()
-    summary_writer = tf.summary.FileWriter(logger.get_logger_dir())
-
-    trainer.setup_callbacks(callbacks=[
-            MergeAllSummaries()],
-        monitors=[TFEventWriter()])
-
-    trainer.sess = tfutils.sesscreate.NewSessionCreator().create_session()
-    trainer.initialize_hooks()
-    trainer.sess.graph.finalize()
-    for pred in trainer._predictors:
-        pred.sess = trainer.sess
-
-    with trainer.sess.as_default():
-        trainer.loop.config(STEPS_PER_EPOCH, 1, 9**9)
-        trainer.loop.update_global_step()
-        trainer._callbacks.before_train()  # Used by TFEventWriter, queue_input.get_callback()
-        for trainer.loop._epoch_num in itertools.count(1):  # TODO itertools.count() when trainer loop is removed
-            for trainer.loop._local_step in range(trainer.loop.steps_per_epoch):
-                train_data = next(expreplayiter)
-                placeholders = expreplay.get_input_tensors()
-                feed_dict = {placeholders[0]: train_data[0], placeholders[1]: train_data[1], placeholders[2]: train_data[2], placeholders[3]: train_data[3]}
-                trainer.hooked_sess.run(trainer.train_op, feed_dict=feed_dict)
-            update_target_param_op.run()
+    summary_writer = tf.summary.FileWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
+    with tfutils.sesscreate.NewSessionCreator().create_session() as sess:
+        for step_idx, batch in enumerate(expreplay):
+            sess.run(train_op, feed_dict=dict(zip(placeholders, batch)))
             if expreplay.exploration > MIN_EPSILON:
                 expreplay.exploration -= (START_EPSILON - MIN_EPSILON) / STOP_EPSILON_DECAY_AT
-            mean, max = expreplay.runner.reset_stats()
-            summary_writer.add_summary(
-                tf.Summary(value=(
-                    tf.Summary.Value(tag='expreplay/mean_score', simple_value=mean),
-                    tf.Summary.Value(tag='expreplay/max_score', simple_value=max))),
-                trainer.loop._epoch_num * STEPS_PER_EPOCH)
-            trainer._callbacks.trigger_epoch()  # Used by TFEventWriter
+            if step_idx > 0 and step_idx % 5000 == 0:
+                update_target_param_op.run()
+                mean, max = expreplay.runner.reset_stats()
+                summary_writer.add_summary(
+                    tf.Summary(value=(
+                        tf.Summary.Value(tag='expreplay/mean_score', simple_value=mean),
+                        tf.Summary.Value(tag='expreplay/max_score', simple_value=max))),
+                    step_idx)
 
 
 if __name__ == '__main__':
