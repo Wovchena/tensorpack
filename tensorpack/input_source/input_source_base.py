@@ -13,7 +13,7 @@ from ..utils import logger
 from ..utils.argtools import call_only_once, memoized_method
 from ..compat import tfv1
 
-__all__ = ['InputSource', 'remap_input_source']
+__all__ = ['InputSource', 'remap_input_source', 'build_or_reuse_placeholder']
 
 
 def build_or_reuse_placeholder(tensor_spec):

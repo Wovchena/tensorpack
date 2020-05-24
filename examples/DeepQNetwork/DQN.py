@@ -125,6 +125,21 @@ def update_target_param():
     return tf.group(*ops, name='update_target_network')
 
 
+class ExpReplayWithPlaceholders(ExpReplay):
+    def __init__(self, modelinputs, predictor_io_names, get_player, num_parallel_players, state_shape, batch_size,
+            memory_size, init_memory_size, update_frequency, history_len, state_dtype):
+        super().__init__(predictor_io_names=predictor_io_names, get_player=get_player,
+            num_parallel_players=num_parallel_players, state_shape=state_shape, batch_size=batch_size,
+            memory_size=memory_size, init_memory_size=init_memory_size, update_frequency=update_frequency,
+            history_len=history_len, state_dtype=state_dtype)
+        self.placeholders = [build_or_reuse_placeholder(v) for v in modelinputs]  # TODO take placeholders as argument
+
+    def get_input_tensors(self): return self.placeholders
+
+    @staticmethod
+    def setup_done(): return True
+
+
 def main():
     BATCH_SIZE = 64
     IMAGE_SIZE = (84, 75)
@@ -140,7 +155,8 @@ def main():
 
     logger.set_logger_dir(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     model = Model(IMAGE_SIZE, FRAME_HISTORY, get_player().action_space.n)
-    expreplay = ExpReplay(
+    expreplay = ExpReplayWithPlaceholders(
+        model.inputs(),
         predictor_io_names=(['state'], ['Qvalue']),
         get_player=get_player,
         num_parallel_players=NUM_PARALLEL_PLAYERS,
@@ -153,14 +169,12 @@ def main():
         state_dtype=model.state_dtype.as_numpy_dtype
     )
 
-    queue_input = QueueInput(expreplay)
-    queue_input._setup(model.get_input_signature())
-    queue_input._setup_done = True
+    expreplayiter = iter(expreplay)
 
     trainer = SimpleTrainer()
-    trainer.tower_func = tfutils.tower.TowerFunc(model.build_graph, model.get_input_signature())
+    trainer.tower_func = tfutils.tower.TowerFunc(model.build_graph, model.inputs())
     with tfutils.TowerContext('', True):
-        grads = trainer._make_get_grad_fn(queue_input, trainer.tower_func, model.get_optimizer)()
+        grads = trainer._make_get_grad_fn(expreplay, trainer.tower_func, model.get_optimizer)()
         trainer.train_op = model.get_optimizer().apply_gradients(grads, name='train_op')
 
     update_target_param_op = update_target_param()
@@ -169,7 +183,6 @@ def main():
     summary_writer = tf.summary.FileWriter(logger.get_logger_dir())
 
     trainer.setup_callbacks(callbacks=[
-            queue_input.get_callbacks(),
             MergeAllSummaries()],
         monitors=[TFEventWriter()])
 
@@ -185,7 +198,10 @@ def main():
         trainer._callbacks.before_train()  # Used by TFEventWriter, queue_input.get_callback()
         for trainer.loop._epoch_num in itertools.count(1):  # TODO itertools.count() when trainer loop is removed
             for trainer.loop._local_step in range(trainer.loop.steps_per_epoch):
-                trainer.hooked_sess.run(trainer.train_op)
+                train_data = next(expreplayiter)
+                placeholders = expreplay.get_input_tensors()
+                feed_dict = {placeholders[0]: train_data[0], placeholders[1]: train_data[1], placeholders[2]: train_data[2], placeholders[3]: train_data[3]}
+                trainer.hooked_sess.run(trainer.train_op, feed_dict=feed_dict)
             update_target_param_op.run()
             if expreplay.exploration > MIN_EPSILON:
                 expreplay.exploration -= (START_EPSILON - MIN_EPSILON) / STOP_EPSILON_DECAY_AT
