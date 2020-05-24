@@ -166,6 +166,7 @@ def main():
     update_target_param_op = update_target_param()
     expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
     expreplay._before_train()
+    summary_writer = tf.summary.FileWriter(logger.get_logger_dir())
 
     trainer.setup_callbacks(callbacks=[
             queue_input.get_callbacks(),
@@ -181,7 +182,7 @@ def main():
     with trainer.sess.as_default():
         trainer.loop.config(STEPS_PER_EPOCH, 1, 9**9)
         trainer.loop.update_global_step()
-        trainer._callbacks.before_train()  # Used by TFEventWriter
+        trainer._callbacks.before_train()  # Used by TFEventWriter, queue_input.get_callback()
         for trainer.loop._epoch_num in itertools.count(1):  # TODO itertools.count() when trainer loop is removed
             for trainer.loop._local_step in range(trainer.loop.steps_per_epoch):
                 trainer.hooked_sess.run(trainer.train_op)
@@ -189,8 +190,11 @@ def main():
             if expreplay.exploration > MIN_EPSILON:
                 expreplay.exploration -= (START_EPSILON - MIN_EPSILON) / STOP_EPSILON_DECAY_AT
             mean, max = expreplay.runner.reset_stats()
-            trainer.monitors.put_scalar('expreplay/mean_score', mean)
-            trainer.monitors.put_scalar('expreplay/max_score', max)
+            summary_writer.add_summary(
+                tf.Summary(value=(
+                    tf.Summary.Value(tag='expreplay/mean_score', simple_value=mean),
+                    tf.Summary.Value(tag='expreplay/max_score', simple_value=max))),
+                trainer.loop._epoch_num * STEPS_PER_EPOCH)
             trainer._callbacks.trigger_epoch()  # Used by TFEventWriter
 
 
