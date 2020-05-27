@@ -172,10 +172,23 @@ def main():
         train_op = model.opt.apply_gradients(grads)  # name='train_op'
 
     update_target_param_op = update_target_param()
-    expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
-    expreplay._before_train()
     summary_writer = tf.summary.FileWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     with tfutils.sesscreate.NewSessionCreator().create_session() as sess:
+        # expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
+        tower_name = 'tower-pred-0'
+        device_id = 0
+        device = '/gpu:0'
+        vs_name = trainer._vs_name_for_predictor(device_id)
+        with tf.variable_scope(tf.get_variable_scope(), reuse=True), tf.device(device), \
+                tfutils.tower.PredictTowerContext(tower_name, vs_name=vs_name):
+            trainer.tower_func(*placeholders)
+        tower = trainer.tower_func.towers[tower_name]
+        input_tensors = tower.get_tensors(['state'])
+        output_tensors = tower.get_tensors(['Qvalue'])
+        predictor = OnlinePredictor(input_tensors, output_tensors)
+        expreplay.predictor = predictor
+        # expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
+        expreplay._before_train()
         for step_idx, batch in enumerate(expreplay):
             sess.run(train_op, feed_dict=dict(zip(placeholders, batch)))
             if expreplay.exploration > MIN_EPSILON:
