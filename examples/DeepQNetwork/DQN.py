@@ -12,6 +12,8 @@ import gym.wrappers
 import tensorflow as tf
 
 import tensorpack
+import torch
+import torch.nn.functional as F
 
 from expreplay import ExpReplay
 
@@ -29,7 +31,7 @@ class CropGrayScaleResizeWrapper(gym.ObservationWrapper):
 
 def get_player():
     return CropGrayScaleResizeWrapper(gym.wrappers.TimeLimit(gym.envs.atari.AtariEnv('breakout', obs_type='image',
-        frameskip=4, repeat_action_probability=0.25), 60000))
+        frameskip=4, repeat_action_probability=0.25), max_episode_steps=60000))
 
 
 class Model:
@@ -140,13 +142,63 @@ class TfAdapter:
         self.sess.run(self.train_op, feed_dict=dict(zip(self.placeholders, batch)))
 
     def update_target(self):
-        self.update_target_op.run()
+        with self.sess.as_default():
+            self.update_target_op.run()
+
+
+class DQN(torch.nn.Module):
+    def __init__(self, state_dim, n_actions):
+        super().__init__()
+        self.conv1 = torch.nn.Conv2d(state_dim, 32, kernel_size=8, stride=4, padding=4)
+        self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=2)
+        self.conv3 = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
+        self.linear1 = torch.nn.Linear(7680, 512)
+        self.linear2 = torch.nn.Linear(512, n_actions)
+
+    def forward(self, state):
+        c1 = torch.nn.functional.leaky_relu(self.conv3(torch.nn.functional.leaky_relu(self.conv2(torch.nn.functional.leaky_relu(self.conv1(state))))))
+        fc1 = F.leaky_relu(self.linear1(c1.view(c1.shape[0], -1)))
+        return self.linear2(fc1)
+
+
+class TorchAdapter:
+    def __init__(self):
+        self.DEVICE = 'cuda'
+        self.GAMMA = torch.tensor(0.99, dtype=torch.float32, device=self.DEVICE)
+        self.action_state_value_func = DQN(4, 4).to(self.DEVICE)
+        self.target_func = DQN(4, 4).to(self.DEVICE)  # copy.deepcopy(action_state_value_func)
+        self.target_func.load_state_dict(self.action_state_value_func.state_dict())
+        self.target_func.eval()
+        self.optimizer = torch.optim.RMSprop(self.action_state_value_func.parameters(), lr=1e-3, alpha=0.99, eps=1e-02,
+                                             weight_decay=0.95, momentum=0.95, centered=False)
+
+    def infer(self, state):
+        with torch.no_grad():
+            return self.action_state_value_func(
+                torch.tensor(np.moveaxis(state, 3, 1), dtype=torch.float32, device=self.DEVICE)).cpu()[None, :, :]
+
+    def train_step(self, batch):
+        observations = torch.tensor(np.moveaxis(batch[0], 3, 1), dtype=torch.float32, device=self.DEVICE)
+        actions = torch.tensor(batch[1].astype(np.int64), dtype=torch.int64, device=self.DEVICE)
+        rewards = torch.tensor(batch[2], dtype=torch.float32, device=self.DEVICE).clamp_(-1.0, 1.0)
+        dones = torch.tensor(batch[3].astype(np.float32), dtype=torch.float32, device=self.DEVICE)
+        with torch.no_grad():
+            next_values, _ = self.target_func(observations[:, 1:]).max(1)
+        values = self.GAMMA * (1.0 - dones) * next_values + rewards
+        self.optimizer.zero_grad()
+        chosen_q_values = self.action_state_value_func(observations[:, :-1]).gather(1, actions.unsqueeze(1))
+        loss = torch.nn.functional.smooth_l1_loss(chosen_q_values.squeeze(), values)
+        loss.backward()
+        self.optimizer.step()
+
+    def update_target(self):
+        self.target_func.load_state_dict(self.action_state_value_func.state_dict())
 
 
 def main():
     BATCH_SIZE = 64
     IMAGE_SIZE = (84, 75)
-    FRAME_HISTORY = 4   
+    FRAME_HISTORY = 4
     UPDATE_FREQ = 4  # the number of new state transitions per parameter update (per training step)
     MEMORY_SIZE = 10**6
     INIT_MEMORY_SIZE = MEMORY_SIZE // 20
@@ -156,6 +208,7 @@ def main():
     STOP_EPSILON_DECAY_AT = 250000
 
     adapter = TfAdapter(IMAGE_SIZE, FRAME_HISTORY)
+    # adapter = TorchAdapter()
     summary_writer = tf.summary.FileWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     expreplay = ExpReplay(
         adapter.infer,
