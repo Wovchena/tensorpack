@@ -12,7 +12,7 @@ import gym.wrappers
 import tensorflow as tf
 
 import tensorpack
-from tensorpack import *
+# from tensorpack import *
 
 from expreplay import ExpReplay
 
@@ -46,7 +46,6 @@ class Model:
         self._stacked_state_shape = (-1, ) + self.state_shape + (history, )
         self.history = history
         self.num_actions = num_actions
-        self.opt = tf.train.RMSPropOptimizer(1e-3, decay=0.95, momentum=0.95, epsilon=1e-2)
 
     def inputs(self):
         # When we use h history frames, the current state and the next state will have (h-1) overlapping frames.
@@ -59,17 +58,22 @@ class Model:
 
     @tensorpack.tfutils.scope_utils.auto_reuse_variable_scope
     def get_DQN_prediction(self, image):
-        with argscope(Conv2D, use_bias=True):
-            l = (LinearWrap(image)
-                 .Conv2D('conv0', 32, 8, strides=4)
-                 .tf.nn.leaky_relu(0.01)
-                 .Conv2D('conv1', 64, 4, strides=2)
-                 .tf.nn.leaky_relu(0.01)
-                 .Conv2D('conv2', 64, 3)
-                 .tf.nn.leaky_relu(0.01)
-                 .FullyConnected('fc0', 512)
-                 .tf.nn.leaky_relu(0.01)())
-        Q = FullyConnected('fct', l, self.num_actions)
+        # model = tf.keras.Sequential((
+        #     tf.keras.layers.Conv2D(32, kernel_size=8, strides=8, activation=tf.keras.layers.LeakyReLU(0.01)),
+        #     tf.keras.layers.Conv2D(64, kernel_size=4, strides=2, activation=tf.keras.layers.LeakyReLU(0.01)),
+        #     tf.keras.layers.Conv2D(64, kernel_size=3, strides=1, activation=tf.keras.layers.LeakyReLU(0.01)),
+        #     tf.keras.layers.Dense(512, activation=tf.keras.layers.LeakyReLU(0.01)),
+        #     tf.keras.layers.Dense(self.num_actions)))
+        Q = (tensorpack.LinearWrap(image)
+             .Conv2D('conv0', 32, 8, strides=4)
+             .tf.nn.leaky_relu(0.01)
+             .Conv2D('conv1', 64, 4, strides=2)
+             .tf.nn.leaky_relu(0.01)
+             .Conv2D('conv2', 64, 3)
+             .tf.nn.leaky_relu(0.01)
+             .FullyConnected('fc0', 512)
+             .tf.nn.leaky_relu(0.01)
+             .FullyConnected('fct', self.num_actions)())
         return tf.identity(Q, name='Qvalue')
 
     def build_graph(self, comb_state, action, reward, isOver):
@@ -92,11 +96,11 @@ class Model:
         action_onehot = tf.one_hot(action, self.num_actions, 1.0, 0.0)
 
         pred_action_value = tf.reduce_sum(predict_value * action_onehot, 1)  # N,
-        max_pred_reward = tf.reduce_mean(tf.reduce_max(
-            predict_value, 1), name='predict_reward')
-        summary.add_moving_summary(max_pred_reward)
+        # max_pred_reward = tf.reduce_mean(tf.reduce_max(
+        #     predict_value, 1), name='predict_reward')
+        # summary.add_moving_summary(max_pred_reward)
 
-        with tf.variable_scope('target'), varreplace.freeze_variables(skip_collection=True):
+        with tf.variable_scope('target'):#, varreplace.freeze_variables(skip_collection=True):
             targetQ_predict_value = self.get_DQN_prediction(next_state)    # NxA
 
         best_v = tf.reduce_max(targetQ_predict_value, 1)    # N,
@@ -104,11 +108,8 @@ class Model:
 
         cost = tf.losses.huber_loss(
             target, pred_action_value, reduction=tf.losses.Reduction.MEAN)
-        summary.add_moving_summary(cost)
+        # summary.add_moving_summary(cost)
         return cost
-
-    def optimizer(self):
-        return self.opt
 
 
 def update_target_param():
@@ -121,17 +122,6 @@ def update_target_param():
             new_name = target_name.replace('target/', '')
             ops.append(v.assign(G.get_tensor_by_name(new_name + ':0')))
     return tf.group(*ops, name='update_target_network')
-
-
-class ExpReplayWithPlaceholders(ExpReplay):
-    def __init__(self, placeholders, **kwargs):
-        super().__init__(**kwargs)
-        self.placeholders = placeholders
-
-    def get_input_tensors(self): return self.placeholders
-
-    @staticmethod
-    def setup_done(): return True
 
 
 def main():
@@ -149,8 +139,7 @@ def main():
     model = Model(IMAGE_SIZE, FRAME_HISTORY, get_player().action_space.n)
     placeholders = tuple(tf.placeholder(tensor_spec.dtype, shape=tensor_spec.shape, name=tensor_spec.name)
                          for tensor_spec in model.inputs())
-    expreplay = ExpReplayWithPlaceholders(
-        placeholders,
+    expreplay = ExpReplay(
         predictor_io_names=(['state'], ['Qvalue']),
         get_player=get_player,
         num_parallel_players=NUM_PARALLEL_PLAYERS,
@@ -163,15 +152,15 @@ def main():
         state_dtype=model.state_dtype.as_numpy_dtype
     )
 
-    train_op = model.opt.minimize(model.build_graph(*placeholders))
+    opt = tf.train.RMSPropOptimizer(1e-3, decay=0.95, momentum=0.95, epsilon=1e-2)
+    train_op = opt.minimize(model.build_graph(*placeholders))
     update_target_param_op = update_target_param()
+    with tf.name_scope('tower-pred-0/'):
+        model.build_graph(*placeholders)
     summary_writer = tf.summary.FileWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
-    with tfutils.sesscreate.NewSessionCreator().create_session() as sess:
-        # expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
-        with tf.name_scope('tower-pred-0/'):
-            model.build_graph(*placeholders)
+    with tf.Session() as sess:
+        sess.run(tf.initialize_all_variables())
         expreplay.predictor = sess.make_callable(fetches=['tower-pred-0/Qvalue:0'], feed_list=['tower-pred-0/state:0'])
-        # expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
         expreplay._before_train()
         for step_idx, batch in enumerate(expreplay):
             sess.run(train_op, feed_dict=dict(zip(placeholders, batch)))
