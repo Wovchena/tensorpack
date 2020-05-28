@@ -33,7 +33,7 @@ def get_player():
         frameskip=4, repeat_action_probability=0.25), 60000))
 
 
-class Model(ModelDesc):
+class Model:
     state_dtype = tf.float32
 
     def __init__(self, state_shape, history, num_actions):
@@ -81,9 +81,7 @@ class Model(ModelDesc):
             [0] * input_rank,
             [-1] * (input_rank - 1) + [self.history], name='state')
 
-        self.predict_value = self.get_DQN_prediction(state)
-        if not self.training:
-            return
+        predict_value = self.get_DQN_prediction(state)
 
         reward = tf.clip_by_value(reward, -1, 1)
         next_state = tf.slice(
@@ -93,9 +91,9 @@ class Model(ModelDesc):
         next_state = tf.reshape(next_state, self._stacked_state_shape)
         action_onehot = tf.one_hot(action, self.num_actions, 1.0, 0.0)
 
-        pred_action_value = tf.reduce_sum(self.predict_value * action_onehot, 1)  # N,
+        pred_action_value = tf.reduce_sum(predict_value * action_onehot, 1)  # N,
         max_pred_reward = tf.reduce_mean(tf.reduce_max(
-            self.predict_value, 1), name='predict_reward')
+            predict_value, 1), name='predict_reward')
         summary.add_moving_summary(max_pred_reward)
 
         with tf.variable_scope('target'), varreplace.freeze_variables(skip_collection=True):
@@ -165,23 +163,14 @@ def main():
         state_dtype=model.state_dtype.as_numpy_dtype
     )
 
-    trainer = SimpleTrainer()
-    trainer.tower_func = tfutils.tower.TowerFunc(model.build_graph, model.inputs())
-    with tfutils.TowerContext('', True):
-        grads = trainer._make_get_grad_fn(expreplay, trainer.tower_func, model.optimizer)()
-        train_op = model.opt.apply_gradients(grads)  # name='train_op'
-
+    train_op = model.opt.minimize(model.build_graph(*placeholders))
     update_target_param_op = update_target_param()
     summary_writer = tf.summary.FileWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     with tfutils.sesscreate.NewSessionCreator().create_session() as sess:
         # expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
-        tower_name = 'tower-pred-0'
-        device = '/gpu:0'
-        with tf.variable_scope(tf.get_variable_scope(), reuse=True), tf.device(device), \
-                tfutils.tower.PredictTowerContext(tower_name, vs_name=''):
-            trainer.tower_func(*placeholders)
-        predictor = OnlinePredictor(['tower-pred-0/state:0'], ['tower-pred-0/Qvalue:0'])
-        expreplay.predictor = predictor
+        with tf.name_scope('tower-pred-0/'):
+            model.build_graph(*placeholders)
+        expreplay.predictor = sess.make_callable(fetches=['tower-pred-0/Qvalue:0'], feed_list=['tower-pred-0/state:0'])
         # expreplay.predictor = trainer.get_predictor(['state'], ['Qvalue'])
         expreplay._before_train()
         for step_idx, batch in enumerate(expreplay):
