@@ -12,7 +12,6 @@ import gym.wrappers
 import tensorflow as tf
 
 import tensorpack
-# from tensorpack import *
 
 from expreplay import ExpReplay
 
@@ -96,11 +95,8 @@ class Model:
         action_onehot = tf.one_hot(action, self.num_actions, 1.0, 0.0)
 
         pred_action_value = tf.reduce_sum(predict_value * action_onehot, 1)  # N,
-        # max_pred_reward = tf.reduce_mean(tf.reduce_max(
-        #     predict_value, 1), name='predict_reward')
-        # summary.add_moving_summary(max_pred_reward)
 
-        with tf.variable_scope('target'):#, varreplace.freeze_variables(skip_collection=True):
+        with tf.variable_scope('target'):
             targetQ_predict_value = self.get_DQN_prediction(next_state)    # NxA
 
         best_v = tf.reduce_max(targetQ_predict_value, 1)    # N,
@@ -108,7 +104,6 @@ class Model:
 
         cost = tf.losses.huber_loss(
             target, pred_action_value, reduction=tf.losses.Reduction.MEAN)
-        # summary.add_moving_summary(cost)
         return cost
 
 
@@ -139,19 +134,6 @@ def main():
     model = Model(IMAGE_SIZE, FRAME_HISTORY, get_player().action_space.n)
     placeholders = tuple(tf.placeholder(tensor_spec.dtype, shape=tensor_spec.shape, name=tensor_spec.name)
                          for tensor_spec in model.inputs())
-    expreplay = ExpReplay(
-        predictor_io_names=(['state'], ['Qvalue']),
-        get_player=get_player,
-        num_parallel_players=NUM_PARALLEL_PLAYERS,
-        state_shape=model.state_shape,
-        batch_size=BATCH_SIZE,
-        memory_size=MEMORY_SIZE,
-        init_memory_size=INIT_MEMORY_SIZE,
-        update_frequency=UPDATE_FREQ,
-        history_len=FRAME_HISTORY,
-        state_dtype=model.state_dtype.as_numpy_dtype
-    )
-
     opt = tf.train.RMSPropOptimizer(1e-3, decay=0.95, momentum=0.95, epsilon=1e-2)
     train_op = opt.minimize(model.build_graph(*placeholders))
     update_target_param_op = update_target_param()
@@ -160,7 +142,18 @@ def main():
     summary_writer = tf.summary.FileWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     with tf.Session() as sess:
         sess.run(tf.initialize_all_variables())
-        expreplay.predictor = sess.make_callable(fetches=['tower-pred-0/Qvalue:0'], feed_list=['tower-pred-0/state:0'])
+        expreplay = ExpReplay(
+            sess.make_callable(fetches=['tower-pred-0/Qvalue:0'], feed_list=['tower-pred-0/state:0']),
+            get_player=get_player,
+            num_parallel_players=NUM_PARALLEL_PLAYERS,
+            state_shape=model.state_shape,
+            batch_size=BATCH_SIZE,
+            memory_size=MEMORY_SIZE,
+            init_memory_size=INIT_MEMORY_SIZE,
+            update_frequency=UPDATE_FREQ,
+            history_len=FRAME_HISTORY,
+            state_dtype=model.state_dtype.as_numpy_dtype
+        )
         expreplay._before_train()
         for step_idx, batch in enumerate(expreplay):
             sess.run(train_op, feed_dict=dict(zip(placeholders, batch)))

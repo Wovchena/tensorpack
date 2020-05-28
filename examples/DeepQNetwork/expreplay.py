@@ -6,16 +6,10 @@ import copy
 import itertools
 import numpy as np
 import threading
+import tqdm
 from collections import namedtuple
 from six.moves import queue, range
 
-from tensorpack.utils.concurrency import LoopThread, ShareSessionThread
-from tensorpack.callbacks.base import Callback
-from tensorpack.dataflow import DataFlow
-from tensorpack.utils import logger, get_rng, get_tqdm
-from tensorpack.utils.stats import StatCounter
-
-__all__ = ['ExpReplay']
 
 Experience = namedtuple('Experience',
                         ['state', 'action', 'reward', 'isOver'])
@@ -36,7 +30,7 @@ class ReplayMemory(object):
         self.dtype = dtype
 
         all_state_shape = (self.max_size,) + state_shape
-        logger.info("Creating experience replay buffer of {:.1f} GB ... "
+        print("Creating experience replay buffer of {:.1f} GB ... "
                     "use a smaller buffer if you don't have enough CPU memory.".format(
                         np.prod(all_state_shape) / 1024.0**3))
         self.state = np.zeros(all_state_shape, dtype=self.dtype)
@@ -134,10 +128,10 @@ class EnvRunner(object):
 
         self._current_episode = []
         self._current_ob = player.reset()
-        self._current_game_score = StatCounter()  # store per-step reward
+        self._current_game_score = []  # store per-step reward
         self.total_scores = []  # store per-game total score
 
-        self.rng = get_rng(self)
+        self.rng = np.random
 
     def step(self, exploration):
         """
@@ -158,7 +152,7 @@ class EnvRunner(object):
             act = np.argmax(q_values)
 
         self._current_ob, reward, isOver, info = self.player.step(act)
-        self._current_game_score.feed(reward)
+        self._current_game_score.append(reward)
         self._current_episode.append(Experience(old_s, act, reward, isOver))
 
         if isOver:
@@ -171,8 +165,8 @@ class EnvRunner(object):
             self.player.reset()
 
             if flush_experience:
-                self.total_scores.append(self._current_game_score.sum)
-                self._current_game_score.reset()
+                self.total_scores.append(sum(self._current_game_score))
+                self._current_game_score = []
 
                 # Ensure that the whole episode of experience is continuous in the replay buffer
                 with self.memory.writer_lock:
@@ -250,11 +244,11 @@ class EnvRunnerManager(object):
         try:
             return np.mean(scores), np.max(scores)
         except Exception:
-            logger.exception("Cannot compute total scores in EnvRunner.")
+            print("Cannot compute total scores in EnvRunner.")
             return None, None
 
 
-class ExpReplay(DataFlow, Callback):
+class ExpReplay:
     """
     Implement experience replay in the paper
     `Human-level control through deep reinforcement learning
@@ -276,7 +270,7 @@ class ExpReplay(DataFlow, Callback):
     """
 
     def __init__(self,
-                 predictor_io_names,
+                 predictor,
                  get_player,
                  num_parallel_players,
                  state_shape,
@@ -286,8 +280,7 @@ class ExpReplay(DataFlow, Callback):
                  state_dtype='uint8'):
         """
         Args:
-            predictor_io_names (tuple of list of str): input/output names to
-                predict Q value from state.
+            predictor
             get_player (-> gym.Env): a callable which returns a player.
             num_parallel_players (int): number of players to run in parallel.
                 Standard DQN uses 1.
@@ -304,6 +297,7 @@ class ExpReplay(DataFlow, Callback):
             state_dtype (str):
         """
         assert len(state_shape) in [1, 2, 3], state_shape
+        self.predictor = predictor
         init_memory_size = int(init_memory_size)
 
         for k, v in locals().items():
@@ -311,15 +305,15 @@ class ExpReplay(DataFlow, Callback):
                 setattr(self, k, v)
         self.exploration = 1.0  # default initial exploration
 
-        self.rng = get_rng(self)
+        self.rng = np.random
         self._init_memory_flag = threading.Event()  # tell if memory has been initialized
 
         self.mem = ReplayMemory(memory_size, state_shape, self.history_len, dtype=state_dtype)
 
     def _init_memory(self):
-        logger.info("Populating replay memory with epsilon={} ...".format(self.exploration))
+        print("Populating replay memory with epsilon={} ...".format(self.exploration))
 
-        with get_tqdm(total=self.init_memory_size) as pbar:
+        with tqdm.tqdm(total=self.init_memory_size) as pbar:
             while len(self.mem) < self.init_memory_size:
                 self.runner.step(self.exploration)
                 pbar.update()
@@ -328,7 +322,7 @@ class ExpReplay(DataFlow, Callback):
     # quickly fill the memory for debug
     def _fake_init_memory(self):
         from copy import deepcopy
-        with get_tqdm(total=self.init_memory_size) as pbar:
+        with tqdm.tqdm(total=self.init_memory_size) as pbar:
             while len(self.mem) < 5:
                 self.runner.step(self.exploration)
                 pbar.update()
