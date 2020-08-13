@@ -12,8 +12,8 @@ import gym.wrappers
 import tensorflow as tf
 
 import tensorpack
-import torch
-import torch.nn.functional as F
+# import torch
+# import torch.nn.functional as F
 
 from expreplay import ExpReplay
 
@@ -98,21 +98,21 @@ class Model:
 
         pred_action_value = tf.reduce_sum(predict_value * action_onehot, 1)  # N,
 
-        with tf.variable_scope('target'):
+        with tf.compat.v1.variable_scope('target'):
             targetQ_predict_value = self.get_DQN_prediction(next_state)    # NxA
 
         best_v = tf.reduce_max(targetQ_predict_value, 1)    # N,
         target = reward + (1.0 - tf.cast(isOver, tf.float32)) * 0.99 * tf.stop_gradient(best_v)
 
-        cost = tf.losses.huber_loss(
-            target, pred_action_value, reduction=tf.losses.Reduction.MEAN)
+        cost = tf.compat.v1.losses.huber_loss(
+            target, pred_action_value, reduction=tf.compat.v1.losses.Reduction.MEAN)
         return cost
 
 
 def update_target_param():
-    vars = tf.global_variables()
+    vars = tf.compat.v1.global_variables()
     ops = []
-    G = tf.get_default_graph()
+    G = tf.compat.v1.get_default_graph()
     for v in vars:
         target_name = v.op.name
         if target_name.startswith('target'):
@@ -124,17 +124,17 @@ def update_target_param():
 class TfAdapter:
     def __init__(self, image_size, frame_history):
         self.model = Model(image_size, frame_history, get_player().action_space.n)
-        self.placeholders = tuple(tf.placeholder(tensor_spec.dtype, shape=tensor_spec.shape, name=tensor_spec.name)
+        self.placeholders = tuple(tf.compat.v1.placeholder(tensor_spec.dtype, shape=tensor_spec.shape, name=tensor_spec.name)
                              for tensor_spec in self.model.inputs())
-        self.opt = tf.train.RMSPropOptimizer(1e-3, decay=0.95, momentum=0.95, epsilon=1e-2)
+        self.opt = tf.compat.v1.train.RMSPropOptimizer(1e-3, decay=0.95, momentum=0.95, epsilon=1e-2)
         self.train_op = self.opt.minimize(self.model.build_graph(*self.placeholders))
 
         self.update_target_op = update_target_param()
 
         with tf.name_scope('tower-pred-0/'):
             self.model.build_graph(*self.placeholders)
-        self.sess = tf.Session()
-        self.sess.run(tf.initialize_all_variables())
+        self.sess = tf.compat.v1.Session()
+        self.sess.run(tf.compat.v1.initialize_all_variables())
 
         self.infer = self.sess.make_callable(fetches=['tower-pred-0/Qvalue:0'], feed_list=['tower-pred-0/state:0'])
 
@@ -146,19 +146,19 @@ class TfAdapter:
             self.update_target_op.run()
 
 
-class DQN(torch.nn.Module):
-    def __init__(self, state_dim, n_actions):
-        super().__init__()
-        self.conv1 = torch.nn.Conv2d(state_dim, 32, kernel_size=8, stride=4, padding=4)
-        self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=2)
-        self.conv3 = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
-        self.linear1 = torch.nn.Linear(7680, 512)
-        self.linear2 = torch.nn.Linear(512, n_actions)
-
-    def forward(self, state):
-        c1 = torch.nn.functional.leaky_relu(self.conv3(torch.nn.functional.leaky_relu(self.conv2(torch.nn.functional.leaky_relu(self.conv1(state))))))
-        fc1 = F.leaky_relu(self.linear1(c1.view(c1.shape[0], -1)))
-        return self.linear2(fc1)
+# class DQN(torch.nn.Module):
+    # def __init__(self, state_dim, n_actions):
+        # super().__init__()
+        # self.conv1 = torch.nn.Conv2d(state_dim, 32, kernel_size=8, stride=4, padding=4)
+        # self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=2)
+        # self.conv3 = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
+        # self.linear1 = torch.nn.Linear(7680, 512)
+        # self.linear2 = torch.nn.Linear(512, n_actions)
+# 
+    # def forward(self, state):
+        # c1 = torch.nn.functional.leaky_relu(self.conv3(torch.nn.functional.leaky_relu(self.conv2(torch.nn.functional.leaky_relu(self.conv1(state))))))
+        # fc1 = F.leaky_relu(self.linear1(c1.view(c1.shape[0], -1)))
+        # return self.linear2(fc1)
 
 
 class TorchAdapter:
@@ -207,9 +207,10 @@ def main():
     START_EPSILON = 1.0
     STOP_EPSILON_DECAY_AT = 250000
 
+    tf.compat.v1.disable_v2_behavior()
     adapter = TfAdapter(IMAGE_SIZE, FRAME_HISTORY)
     # adapter = TorchAdapter()
-    summary_writer = tf.summary.FileWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
+    summary_writer = tf.compat.v1.summary.FileWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y_%H-%M'))
     expreplay = ExpReplay(
         adapter.infer,
         get_player=get_player,
@@ -231,9 +232,9 @@ def main():
             adapter.update_target()
             mean, max = expreplay.runner.reset_stats()
             summary_writer.add_summary(
-                tf.Summary(value=(
-                    tf.Summary.Value(tag='expreplay/mean_score', simple_value=mean),
-                    tf.Summary.Value(tag='expreplay/max_score', simple_value=max))),
+                tf.compat.v1.Summary(value=(
+                    tf.compat.v1.Summary.Value(tag='expreplay/mean_score', simple_value=mean),
+                    tf.compat.v1.Summary.Value(tag='expreplay/max_score', simple_value=max))),
                 step_idx)
 
 
