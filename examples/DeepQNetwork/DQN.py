@@ -44,7 +44,6 @@ class Model:
             history (int):
         """
         self.state_shape = tuple(state_shape)
-        self._stacked_state_shape = (-1, ) + self.state_shape + (history, )
         self.history = history
         self.num_actions = num_actions
 
@@ -83,7 +82,6 @@ class Model:
 
         reward = tf.clip_by_value(reward, -1, 1)
         next_state = comb_state[:, :, :, 1:]
-        next_state = tf.reshape(next_state, self._stacked_state_shape)
         action_onehot = tf.one_hot(action, self.num_actions, 1.0, 0.0)
 
         pred_action_value = tf.reduce_sum(predict_value * action_onehot, 1)  # N,
