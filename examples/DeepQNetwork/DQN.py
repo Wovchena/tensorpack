@@ -78,20 +78,12 @@ class Model:
 
     def build_graph(self, comb_state, action, reward, isOver):
         comb_state = tf.cast(comb_state, tf.float32)
-        input_rank = comb_state.shape.rank
 
-        state = tf.slice(
-            comb_state,
-            [0] * input_rank,
-            [-1] * (input_rank - 1) + [self.history], name='state')
-
+        state = tf.identity(comb_state[:, :, :, :-1], name='state')
         predict_value = self.get_DQN_prediction(state)
 
         reward = tf.clip_by_value(reward, -1, 1)
-        next_state = tf.slice(
-            comb_state,
-            [0] * (input_rank - 1) + [1],
-            [-1] * (input_rank - 1) + [self.history], name='next_state')
+        next_state = comb_state[:, :, :, 1:]
         next_state = tf.reshape(next_state, self._stacked_state_shape)
         action_onehot = tf.one_hot(action, self.num_actions, 1.0, 0.0)
 
