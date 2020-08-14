@@ -64,7 +64,7 @@ class Model:
         #     tf.keras.layers.Conv2D(64, kernel_size=3, strides=1, activation=tf.keras.layers.LeakyReLU(0.01)),
         #     tf.keras.layers.Dense(512, activation=tf.keras.layers.LeakyReLU(0.01)),
         #     tf.keras.layers.Dense(self.num_actions)))
-        Q = (tensorpack.LinearWrap(image)
+        return (tensorpack.LinearWrap(image)
              .Conv2D('conv0', 32, 8, strides=4)
              .tf.nn.leaky_relu(0.01)
              .Conv2D('conv1', 64, 4, strides=2)
@@ -74,13 +74,12 @@ class Model:
              .FullyConnected('fc0', 512)
              .tf.nn.leaky_relu(0.01)
              .FullyConnected('fct', self.num_actions)())
-        return tf.identity(Q, name='Qvalue')
 
     def build_graph(self, comb_state, action, reward, isOver):
         comb_state = tf.cast(comb_state, tf.float32)
 
         state = tf.identity(comb_state[:, :, :, :-1], name='state')
-        predict_value = self.get_DQN_prediction(state)
+        predict_value = tf.identity(self.get_DQN_prediction(state), name='Qvalue')
 
         reward = tf.clip_by_value(reward, -1, 1)
         next_state = comb_state[:, :, :, 1:]
