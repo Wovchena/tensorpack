@@ -57,7 +57,6 @@ class Model:
                 tf.TensorSpec((None,), tf.float32, 'reward'),
                 tf.TensorSpec((None,), tf.bool, 'isOver')]
 
-    @tensorpack.tfutils.scope_utils.auto_reuse_variable_scope
     def get_DQN_prediction(self, image):
         # model = tf.keras.Sequential((
         #     tf.keras.layers.Conv2D(32, kernel_size=8, strides=8, activation=tf.keras.layers.LeakyReLU(0.01)),
@@ -131,12 +130,9 @@ class TfAdapter:
 
         self.update_target_op = update_target_param()
 
-        with tf.name_scope('tower-pred-0/'):
-            self.model.build_graph(*self.placeholders)
         self.sess = tf.compat.v1.Session()
+        self.infer = self.sess.make_callable(fetches=['Qvalue:0'], feed_list=['state:0'])
         self.sess.run(tf.compat.v1.initialize_all_variables())
-
-        self.infer = self.sess.make_callable(fetches=['tower-pred-0/Qvalue:0'], feed_list=['tower-pred-0/state:0'])
 
     def train_step(self, batch):
         self.sess.run(self.train_op, feed_dict=dict(zip(self.placeholders, batch)))
