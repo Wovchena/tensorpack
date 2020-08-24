@@ -11,8 +11,6 @@ import gym.envs.atari
 import gym.wrappers
 import tensorflow as tf
 
-import tensorpack
-
 from expreplay import ExpReplay
 
 
@@ -37,16 +35,13 @@ class Model:
         self.num_actions = num_actions
 
     def get_DQN_prediction(self, image):
-        return (tensorpack.LinearWrap(image)
-             .Conv2D('conv0', 32, 8, strides=4)
-             .tf.nn.relu()
-             .Conv2D('conv1', 64, 4, strides=2)
-             .tf.nn.relu()
-             .Conv2D('conv2', 64, 3)
-             .tf.nn.relu()
-             .FullyConnected('fc0', 512)
-             .tf.nn.relu()
-             .FullyConnected('fct', self.num_actions)())
+        c0 = tf.compat.v1.layers.Conv2D(32, 8, 4, activation='relu')
+        c1 = tf.compat.v1.layers.Conv2D(64, 4 ,2, activation='relu')
+        c2 = tf.compat.v1.layers.Conv2D(64, 3, activation='relu')
+        features = tf.reshape(c2.apply(c1.apply(c0.apply(image))), (-1, 64*7*5))
+        d0 = tf.compat.v1.layers.Dense(512, 'relu')
+        d1 = tf.compat.v1.layers.Dense(self.num_actions)
+        return d1.apply(d0.apply(features))
 
     def build_graph(self, comb_state, action, reward, isOver):
         comb_state = tf.cast(comb_state, tf.float32)
