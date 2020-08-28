@@ -33,21 +33,25 @@ def get_player():
 class Model:
     def __init__(self, num_actions):
         self.num_actions = num_actions
+        self.c0 = tf.compat.v1.layers.Conv2D(32, 8, 4, activation='relu', name='conv2d_0')
+        self.c1 = tf.compat.v1.layers.Conv2D(64, 4, 2, activation='relu', name='conv2d_1')
+        self.c2 = tf.compat.v1.layers.Conv2D(64, 3, activation='relu', name='conv2d_2')
+        self.d0 = tf.compat.v1.layers.Dense(512, 'relu', name='dense_0')
+        self.d1 = tf.compat.v1.layers.Dense(self.num_actions, name='dense_1')
+        self.c10 = tf.compat.v1.layers.Conv2D(32, 8, 4, activation='relu', name='target/conv2d_0')
+        self.c11 = tf.compat.v1.layers.Conv2D(64, 4, 2, activation='relu', name='target/conv2d_1')
+        self.c12 = tf.compat.v1.layers.Conv2D(64, 3, activation='relu', name='target/conv2d_2')
+        self.d10 = tf.compat.v1.layers.Dense(512, 'relu', name='target/dense_0')
+        self.d11 = tf.compat.v1.layers.Dense(self.num_actions, name='target/dense_1')
 
-    def get_DQN_prediction(self, image):
-        c0 = tf.compat.v1.layers.Conv2D(32, 8, 4, activation='relu')
-        c1 = tf.compat.v1.layers.Conv2D(64, 4 ,2, activation='relu')
-        c2 = tf.compat.v1.layers.Conv2D(64, 3, activation='relu')
-        features = tf.reshape(c2.apply(c1.apply(c0.apply(image))), (-1, 64*7*5))
-        d0 = tf.compat.v1.layers.Dense(512, 'relu')
-        d1 = tf.compat.v1.layers.Dense(self.num_actions)
-        return d1.apply(d0.apply(features))
 
     def build_graph(self, comb_state, action, reward, isOver):
         comb_state = tf.cast(comb_state, tf.float32)
 
         state = tf.identity(comb_state[:, :, :, :-1], name='state')
-        predict_value = tf.identity(self.get_DQN_prediction(state), name='Qvalue')
+        features = tf.reshape(self.c2.apply(self.c1.apply(self.c0.apply(state))), (-1, 64 * 7 * 5))
+        pred = self.d1.apply(self.d0.apply(features))
+        predict_value = tf.identity(pred, name='Qvalue')
 
         reward = tf.clip_by_value(reward, -1, 1)
         next_state = comb_state[:, :, :, 1:]
@@ -55,8 +59,8 @@ class Model:
 
         pred_action_value = tf.reduce_sum(predict_value * action_onehot, 1)  # N,
 
-        with tf.compat.v1.variable_scope('target'):
-            targetQ_predict_value = self.get_DQN_prediction(next_state)    # NxA
+        features = tf.reshape(self.c12.apply(self.c11.apply(self.c10.apply(next_state))), (-1, 64 * 7 * 5))
+        targetQ_predict_value = self.d11.apply(self.d10.apply(features))
 
         best_v = tf.reduce_max(targetQ_predict_value, 1)    # N,
         target = reward + (1.0 - tf.cast(isOver, tf.float32)) * 0.99 * tf.stop_gradient(best_v)
