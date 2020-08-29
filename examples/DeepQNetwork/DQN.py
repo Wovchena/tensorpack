@@ -44,30 +44,27 @@ class Model:
         self.d10 = tf.compat.v1.layers.Dense(512, 'relu', name='target/dense_0')
         self.d11 = tf.compat.v1.layers.Dense(self.num_actions, name='target/dense_1')
 
-
     def build_graph(self, comb_state, action, reward, isOver):
         comb_state = tf.cast(comb_state, tf.float32)
 
         state = tf.identity(comb_state[:, :, :, :-1], name='state')
-        features = tf.reshape(self.c2.apply(self.c1.apply(self.c0.apply(state))), (-1, 64 * 7 * 5))
-        pred = self.d1.apply(self.d0.apply(features))
+        features = tf.reshape(self.c2(self.c1(self.c0(state))), (-1, 64 * 7 * 5))
+        pred = self.d1(self.d0(features))
         predict_value = tf.identity(pred, name='Qvalue')
 
         reward = tf.clip_by_value(reward, -1, 1)
         next_state = comb_state[:, :, :, 1:]
-        action_onehot = tf.one_hot(action, self.num_actions, 1.0, 0.0)
+        action_onehot = tf.one_hot(tf.cast(action, tf.int32), self.num_actions, 1.0, 0.0)
 
         pred_action_value = tf.reduce_sum(predict_value * action_onehot, 1)  # N,
 
-        features = tf.reshape(self.c12.apply(self.c11.apply(self.c10.apply(next_state))), (-1, 64 * 7 * 5))
-        targetQ_predict_value = self.d11.apply(self.d10.apply(features))
+        features = tf.reshape(self.c12(self.c11(self.c10(next_state))), (-1, 64 * 7 * 5))
+        targetQ_predict_value = self.d11(self.d10(features))
 
         best_v = tf.reduce_max(targetQ_predict_value, 1)    # N,
         target = reward + (1.0 - tf.cast(isOver, tf.float32)) * 0.99 * tf.stop_gradient(best_v)
+        return tf.keras.losses.Huber()(target, pred_action_value)
 
-        cost = tf.compat.v1.losses.huber_loss(
-            target, pred_action_value, reduction=tf.compat.v1.losses.Reduction.MEAN)
-        return cost
 
 
 def update_target_param():
